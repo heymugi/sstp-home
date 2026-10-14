@@ -21,14 +21,16 @@ VPN Gate SSTP 节点检测流水线
 import base64
 import csv
 import io
+import ipaddress
 import json
 import os
 import re
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from urllib.parse import quote
+from urllib.parse import quote, urlsplit
 
 import requests
 
@@ -51,7 +53,7 @@ VPNGATE_MIRROR = os.environ.get(
     "https://raw.githubusercontent.com/fdciabdul/Vpngate-Scraper-API/main/json/data.json",
 )
 # 已部署的 Cloudflare Worker 检测接口 (GET /check?proxyip=host:port, 实测确认)
-WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://sstp-check.z13041040331.workers.dev/check?sstp=vpn:vpn@")
+WORKER_CHECK_URL = os.environ.get("CHECK_WORKER", "https://sstp-check.neww.cc.cd/check?sstp=vpn:vpn@")
 CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))   # 与 Worker 网页端一致的并发模型
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))          # 单请求客户端超时 (秒)
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))         # 0=不限; 本地测试可设小值
@@ -321,7 +323,9 @@ def check_one(node, session):
     try:
         r = session.get(url, timeout=CHECK_TIMEOUT, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"})
         if r.status_code != 200:
-            out["error"] = f"HTTP {r.status_code}"
+            error_code = re.search(r"(?:error code:\s*|cf-error-code[^>]*>\s*)(\d+)", r.text, re.I)
+            detail = f" (error code: {error_code.group(1)})" if error_code else ""
+            out["error"] = f"HTTP {r.status_code}{detail}"
             out["worker_error"] = True
             return out
         j = r.json()
@@ -407,7 +411,7 @@ def build_outputs(results, raw_count, sstp_count, source):
     return data
 
 
-CHAIN_URL = os.environ.get("CHAIN_URL", "https://jerylihub.github.io/gate/chains.txt")
+CHAIN_URL = os.environ.get("CHAIN_URL", "https://heymugi.github.io/sstp-home/chains.txt")
 
 
 def build_chains_text(data):
@@ -460,28 +464,97 @@ EDGE_HOSTS = [
     h.strip()
     for h in os.environ.get(
         "EDGE_HOSTS",
-        "www.5199dy.com:443,hzytjy.cn:443,ali.nonull.pp.ua:443,auto.dolby.dpdns.org:443,"
-        "cdn.cnno.de:443,saas.sin.fan:443,cf.1o.ee:443",
+        "cloudflare.182682.xyz:443,104.20.25.7:443,104.21.90.14:443,"
+        "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,p.etime.vip:443,"
+        "cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,cf.nyanya.moe:443,"
+        "www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,"
+        "securecircle.com:443,www.shopify.com:443,www.carousell.sg:443,"
+        "www.dbs.com.sg:443,openai.com:443,linear.app:443,uspto.gov:443,www.vmware.com:443",
     ).split(",")
     if h.strip()
 ]
 
-HOSTS_URL = os.environ.get("HOSTS_URL", "https://jerylihub.github.io/gate/hosts.txt")
+# 留空只使用静态入口；配置的 API 失败时明确终止，避免发布缺失的入口池。
+OPTIMAL_API = os.environ.get("OPTIMAL_API", "")
 
 
-def build_hosts_text(data):
+def parse_optimal_api_endpoints(text):
+    """解析优选 API 的 host:port#备注行，拒绝错误页面和无效端口。"""
+    endpoints = []
+    for number, raw in enumerate(text.lstrip("\ufeff").splitlines(), 1):
+        entry = raw.split("#", 1)[0].strip()
+        if not entry:
+            continue
+        try:
+            parsed = urlsplit("//" + entry)
+            host = parsed.hostname
+            port = parsed.port if parsed.port is not None else 443
+            if not host or parsed.username is not None or parsed.password is not None or parsed.path or parsed.query:
+                raise ValueError("Invalid endpoint")
+            if not 1 <= port <= 65535 or entry.endswith(":"):
+                raise ValueError("Invalid port")
+            try:
+                address = ipaddress.ip_address(host)
+            except ValueError:
+                if not re.fullmatch(r"[a-z0-9](?:[a-z0-9.-]*[a-z0-9])?", host) or re.fullmatch(r"[0-9.]+", host):
+                    raise ValueError("Invalid hostname")
+            else:
+                host = f"[{address}]" if address.version == 6 else str(address)
+            endpoints.append(f"{host}:{port}")
+        except ValueError as exc:
+            raise ValueError(f"优选 API 第 {number} 行不是有效入口") from exc
+    return endpoints
+
+
+def fetch_optimal_api_endpoints(api_urls):
+    endpoints = []
+    for url in (item.strip() for item in api_urls.split(",")):
+        if not url:
+            continue
+        parsed = urlsplit(url)
+        if parsed.scheme not in ("http", "https") or not parsed.hostname:
+            raise ValueError("OPTIMAL_API 必须是 HTTP/HTTPS URL")
+        source = f"{parsed.scheme}://{parsed.hostname}{parsed.path}"
+        log("OPTIMAL API", f"获取优选 API: {source}")
+        try:
+            response = requests.get(url, timeout=HTTP_TIMEOUT, headers={"User-Agent": "Mozilla/5.0"})
+        except requests.RequestException as exc:
+            raise RuntimeError(f"优选 API {source} 获取失败: {type(exc).__name__}") from exc
+        if response.status_code != 200:
+            raise RuntimeError(f"优选 API {source} 返回 HTTP {response.status_code}")
+        parsed_endpoints = parse_optimal_api_endpoints(response.text)
+        if not parsed_endpoints:
+            raise RuntimeError(f"优选 API {source} 没有返回有效入口")
+        log("OPTIMAL API", f"获取到 {len(parsed_endpoints)} 个入口")
+        endpoints.extend(parsed_endpoints)
+    return endpoints
+
+
+def get_combined_edge_hosts():
+    entry = os.environ.get("HOSTS_ENTRY", "").strip()
+    static_hosts = [host.strip() for host in entry.split(",") if host.strip()] if entry else EDGE_HOSTS
+    api_hosts = fetch_optimal_api_endpoints(OPTIMAL_API)
+    combined = list(dict.fromkeys(static_hosts + api_hosts))
+    if not combined:
+        raise RuntimeError("Cloudflare 入口地址池为空")
+    log("EDGE POOL", f"静态入口 {len(static_hosts)} 个, API 入口 {len(api_hosts)} 个, 去重后 {len(combined)} 个")
+    return combined
+
+
+HOSTS_URL = os.environ.get("HOSTS_URL", "https://heymugi.github.io/sstp-home/hosts.txt")
+
+
+def build_hosts_text(data, edge_hosts=None):
     """生成可直接粘贴到 edgetunnel 后台「自定义优选IP」框的清单。
     每行 = 入口地址#名字$sstp://... ; 名字固定, 底下 SSTP 节点每 30 分钟自动换。"""
     countries = data["countries"]
-    # 入口: 默认用 7 个实测可用优选域名循环分配; 可用 HOSTS_ENTRY 覆盖(逗号分隔)
-    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS or [f"{EDT_DOMAIN}:443"]
+    edge = get_combined_edge_hosts() if edge_hosts is None else edge_hosts
     lines = [
         "# edgetunnel「自定义优选IP」清单 (整段复制, 追加到后台现有内容后面)",
         f"# 自动更新: {data['generated_at']} (每 30 分钟重新检测)",
         f"# 固定地址: {HOSTS_URL}",
         "# 每行 = 入口地址#名字$sstp://vpn:vpn@节点:端口",
-        "# 入口用 7 个实测可用优选域名循环分配",
+        f"# 入口用 {len(edge)} 个地址循环分配",
         "# 名字 = 国家-住宅/机房-编号, 直接区分住宅与机房",
         "# 名字固定; 只有 $sstp:// 后面的节点地址每 30 分钟自动更换",
         "# 账号密码固定 vpn:vpn ; 节点端口必须保留",
@@ -526,6 +599,8 @@ EDT_DOMAIN = os.environ.get("EDT_DOMAIN", "sstp.neww.cc.cd")
 
 
 def write_outputs(data):
+    edge_hosts = get_combined_edge_hosts()
+    hosts_text = build_hosts_text(data, edge_hosts)
     os.makedirs(PUBLIC_DIR, exist_ok=True)
     data_path = os.path.join(PUBLIC_DIR, "data.json")
     with open(data_path, "w", encoding="utf-8") as f:
@@ -551,9 +626,13 @@ def write_outputs(data):
     # 可直接粘贴进后台「自定义优选IP」框的清单 (入口地址#名字$sstp://...)
     hosts_path = os.path.join(PUBLIC_DIR, "hosts.txt")
     with open(hosts_path, "w", encoding="utf-8") as f:
-        f.write(build_hosts_text(data))
+        f.write(hosts_text)
 
-    return data_path, html_path, chains_path, hosts_path
+    nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
+    with open(nodes_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(line for line in hosts_text.splitlines() if line and not line.startswith("#")) + "\n")
+
+    return data_path, html_path, chains_path, hosts_path, nodes_path
 
 
 # ---------------------------------------------------------------------------
@@ -595,6 +674,9 @@ def main():
     log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
     log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
+    for error, count in Counter(result.get("error", "unknown error") for result in worker_errors).items():
+        redacted_error = re.sub(r"(sstp(?:=|://))[^@\s]+@", r"\1[REDACTED]@", error)
+        log("CLOUDFLARE WORKER", f"Worker 异常: {redacted_error} ({count} 个)")
 
     # 硬性失败: Worker 完全不可达 (没有任何一个请求拿到正常响应)
     if uniq and not success and len(worker_errors) == len(uniq):
@@ -607,11 +689,12 @@ def main():
     log("RESULT", f"可用节点: {len(success)}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
-    data_path, html_path, chains_path, hosts_path = write_outputs(data)
+    data_path, html_path, chains_path, hosts_path, nodes_path = write_outputs(data)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(chains_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(hosts_path, REPO_DIR)}")
+    log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
     log("WEBSITE", "完成 (GitHub Pages 部署由 workflow 执行)")
 
 

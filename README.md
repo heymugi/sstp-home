@@ -1,6 +1,8 @@
 # VPN Gate SSTP 节点自动优选（edgetunnel 链式代理）
 
-本部署的节点展示页为 https://cmyk-xing.github.io/sstp-home/ ，每 30 分钟检测一次。`hosts.txt` 由独立 edgetunnel 的自定义优选 API 自动读取，无需手工复制。公开页面不生成包含个人 UUID 的 `sub.txt`；客户端订阅由 `sstp.neww.cc.cd` 的私人后台提供。下方保留上游说明，其中示例参数和手动复制步骤不适用于本部署。
+本部署的节点展示页为 https://heymugi.github.io/sstp-home/ ，每 30 分钟检测一次。`hosts.txt` 由独立 edgetunnel 的自定义优选 API 自动读取，无需手工复制。公开页面不生成包含个人 UUID 的 `sub.txt`；客户端订阅由 `sstp.neww.cc.cd` 的私人后台提供。下方保留上游说明，其中示例参数和手动复制步骤不适用于本部署。
+
+已同步上游 2026-10-11 的入口池更新：保留原有 3 个入口并新增通过本机 TLS/HTTP 检查的 19 个入口，统一维护在 `vpngate.py` 的 `EDGE_HOSTS`。这是入口连通性检查，不代表 SSTP 出口验证。`OPTIMAL_API` 支持逗号分隔的多个 HTTP/HTTPS API，格式为 `host:port#备注`，与静态入口合并去重；配置的 API 失败或返回无效内容时终止发布。上游默认 API 当前返回 HTTP 403，因此默认留空。`hosts.txt`、`chains.txt` 保留，并增加相同节点行的无注释 `nodes.txt`；Worker 仍读取 `hosts.txt`。检测 URL 使用 `https://sstp-check.neww.cc.cd/check`，该域名已绑定到现有 `sstp-check` Worker，首页及接口响应正常。
 
 本部署的 Clash 配置由独立 Worker 直接生成，支持当前 VLESS/WS/TLS 节点，避开公共订阅转换服务的 HTTP 502。自动选择与故障转移只纳入住宅候选，每 300 秒测速，超时 15000 毫秒；`clash.ini` 仅用于其他客户端格式的上游转换配置。住宅/机房标签为估算，共享节点的长期稳定性仍需观察。
 
